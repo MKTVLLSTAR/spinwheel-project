@@ -4,37 +4,53 @@ const Token = require("../models/Token");
 const SpinResult = require("../models/SpinResult");
 const router = express.Router();
 
-// Get active prizes (public)
+// Get active prizes (public) - แก้ไขให้รองรับ 8 รางวัลคงที่
 router.get("/prizes", async (req, res) => {
   try {
-    console.log("Fetching active prizes...");
+    console.log("Fetching active prizes for wheel...");
 
-    const prizes = await Prize.find({ isActive: true })
-      .sort({ createdAt: 1 })
-      .select("name description probability color isActive createdAt")
+    // ดึงรางวัลที่เปิดใช้งาน เรียงตาม position หรือ createdAt
+    let prizes = await Prize.find({ isActive: true })
+      .sort({ position: 1, createdAt: 1 })
+      .select("name description probability color isActive position")
       .lean();
 
-    console.log(
-      `Found ${prizes.length} active prizes:`,
-      prizes.map((p) => p.name)
-    );
+    console.log(`Found ${prizes.length} active prizes from database`);
 
-    if (prizes.length === 0) {
-      console.log("No active prizes found");
-      return res.json([]);
+    // ตรวจสอบว่ามีรางวัลเกิน 8 อันไหม
+    if (prizes.length > 8) {
+      console.warn(
+        `⚠️ Too many prizes (${prizes.length}), limiting to first 8`
+      );
+      prizes = prizes.slice(0, 8);
     }
 
-    // Validate prizes
-    const validPrizes = prizes.filter((prize) => {
-      const isValid = prize.name && typeof prize.probability === "number";
-      if (!isValid) {
-        console.warn("Invalid prize found:", prize);
-      }
-      return isValid;
+    // ถ้ารางวัลน้อยกว่า 8 อัน ให้เพิ่มรางวัล "ไม่ได้รางวัล" เติมให้ครบ 8 อัน
+    while (prizes.length < 8) {
+      const emptySlot = {
+        _id: `empty_${prizes.length}`,
+        name: "ไม่ได้รางวัล",
+        description: "โชคไม่ดี ลองใหม่อีกครั้ง",
+        probability: 0,
+        color: "#6B7280",
+        isActive: true,
+        position: prizes.length,
+      };
+      prizes.push(emptySlot);
+      console.log(`Added empty slot at position ${prizes.length - 1}`);
+    }
+
+    // กำหนด position ให้แต่ละรางวัล (0-7)
+    prizes.forEach((prize, index) => {
+      prize.wheelPosition = index;
     });
 
-    console.log(`Returning ${validPrizes.length} valid prizes`);
-    res.json(validPrizes);
+    console.log("Final wheel configuration:");
+    prizes.forEach((prize, index) => {
+      console.log(`Position ${index}: "${prize.name}" (${prize.probability}%)`);
+    });
+
+    res.json(prizes);
   } catch (error) {
     console.error("Error fetching prizes:", error);
     res.status(500).json({
@@ -45,7 +61,7 @@ router.get("/prizes", async (req, res) => {
   }
 });
 
-// Spin wheel (public) - ป้องกันการใช้ token ซ้ำ
+// Spin wheel (public) - แก้ไขให้คำนวณตำแหน่งถูกต้อง
 router.post("/spin", async (req, res) => {
   try {
     const { tokenCode } = req.body;
@@ -56,7 +72,7 @@ router.post("/spin", async (req, res) => {
       return res.status(400).json({ message: "Token code is required" });
     }
 
-    // Validate token with enhanced security
+    // Validate token
     const token = await Token.findOne({
       tokenCode: tokenCode.toUpperCase(),
       isUsed: false,
@@ -65,17 +81,13 @@ router.post("/spin", async (req, res) => {
     });
 
     if (!token) {
-      console.log(
-        `❌ Invalid, expired, deleted, or already used token: ${tokenCode}`
-      );
+      console.log(`❌ Invalid token: ${tokenCode}`);
       return res.status(404).json({
         message: "Invalid, expired, or already used token",
       });
     }
 
-    console.log(`✅ Valid token found: ${token.tokenCode}`);
-
-    // Double-check to prevent race conditions
+    // Mark token as used
     const tokenCheck = await Token.findOneAndUpdate(
       {
         _id: token._id,
@@ -100,78 +112,103 @@ router.post("/spin", async (req, res) => {
     );
 
     if (!tokenCheck) {
-      console.log(`❌ Token was already used or became invalid: ${tokenCode}`);
+      console.log(`❌ Token already used: ${tokenCode}`);
       return res.status(409).json({
         message: "Token has already been used or is no longer valid",
       });
     }
 
-    console.log(`🔒 Token ${tokenCheck.tokenCode} marked as used`);
+    console.log(`✅ Token ${tokenCode} marked as used`);
 
-    // Get active prizes
-    const prizes = await Prize.find({ isActive: true })
-      .sort({ createdAt: 1 })
+    // Get active prizes และสร้างวงล้อ 8 ช่อง
+    let prizes = await Prize.find({ isActive: true })
+      .sort({ position: 1, createdAt: 1 })
       .lean();
 
-    if (prizes.length === 0) {
-      console.log("❌ No active prizes available");
-      return res.status(400).json({ message: "No prizes available" });
+    if (prizes.length > 8) {
+      prizes = prizes.slice(0, 8);
     }
 
-    console.log(`🎁 Found ${prizes.length} active prizes for spinning`);
+    // เติมช่องว่างถ้าน้อยกว่า 8
+    const originalPrizeIds = prizes.map((p) => p._id.toString());
+    while (prizes.length < 8) {
+      prizes.push({
+        _id: `empty_${prizes.length}`,
+        name: "ไม่ได้รางวัล",
+        description: "โชคไม่ดี ลองใหม่อีกครั้ง",
+        probability: 0,
+        color: "#6B7280",
+        isActive: true,
+      });
+    }
 
-    // Calculate total probability
-    const totalProbability = prizes.reduce(
-      (sum, prize) => sum + (prize.probability || 0),
+    console.log(`🎁 Wheel configured with ${prizes.length} slots`);
+
+    // คำนวณการสุ่มรางวัลตามความน่าจะเป็น
+    const realPrizes = prizes.filter(
+      (p) => !p._id.toString().startsWith("empty_") && p.probability > 0
+    );
+    const totalProbability = realPrizes.reduce(
+      (sum, prize) => sum + prize.probability,
       0
     );
 
-    console.log(`📊 Total probability: ${totalProbability}%`);
+    console.log(`📊 Total probability from real prizes: ${totalProbability}%`);
 
-    if (totalProbability === 0) {
-      console.log("❌ Total probability is 0");
-      return res
-        .status(400)
-        .json({ message: "Prize probabilities not configured properly" });
-    }
+    let selectedPrize;
+    let selectedIndex;
 
-    // Calculate random prize based on probability
-    const random = Math.random() * totalProbability;
-    console.log(
-      `🎲 Random value: ${random.toFixed(2)} (out of ${totalProbability})`
-    );
-
-    let currentProbability = 0;
-    let selectedPrize = prizes[0]; // Default fallback
-
-    for (const prize of prizes) {
-      currentProbability += prize.probability || 0;
+    if (totalProbability === 0 || realPrizes.length === 0) {
+      // ถ้าไม่มีรางวัลหรือความน่าจะเป็นเป็น 0 ให้เลือก "ไม่ได้รางวัล"
+      const emptyPrizes = prizes.filter((p) =>
+        p._id.toString().startsWith("empty_")
+      );
+      selectedPrize =
+        emptyPrizes[Math.floor(Math.random() * emptyPrizes.length)];
+      selectedIndex = prizes.findIndex((p) => p._id === selectedPrize._id);
+    } else {
+      // สุ่มรางวัลตามความน่าจะเป็น
+      const random = Math.random() * totalProbability;
       console.log(
-        `🔍 Checking prize "${
-          prize.name
-        }" - cumulative probability: ${currentProbability.toFixed(2)}`
+        `🎲 Random value: ${random.toFixed(2)} (out of ${totalProbability})`
       );
 
-      if (random <= currentProbability) {
-        selectedPrize = prize;
-        console.log(`🎯 Selected prize: "${selectedPrize.name}"`);
-        break;
+      let currentProbability = 0;
+      selectedPrize = realPrizes[0]; // Default fallback
+
+      for (const prize of realPrizes) {
+        currentProbability += prize.probability;
+        if (random <= currentProbability) {
+          selectedPrize = prize;
+          break;
+        }
       }
+
+      // หา index ของรางวัลที่ถูกเลือกในวงล้อ
+      selectedIndex = prizes.findIndex(
+        (p) => p._id.toString() === selectedPrize._id.toString()
+      );
     }
 
-    // Save spin result
-    const spinResult = new SpinResult({
-      tokenCode: tokenCheck.tokenCode,
-      prize: selectedPrize._id,
-      userAgent: req.get("User-Agent"),
-      ipAddress:
-        req.ip || req.connection.remoteAddress || req.socket.remoteAddress,
-    });
+    console.log(
+      `🎯 Selected prize: "${selectedPrize.name}" at wheel position ${selectedIndex}`
+    );
 
-    await spinResult.save();
-    console.log(`💾 Spin result saved with ID: ${spinResult._id}`);
+    // บันทึกผลการหมุน (เฉพาะรางวัลจริง)
+    let spinResult = null;
+    if (!selectedPrize._id.toString().startsWith("empty_")) {
+      spinResult = new SpinResult({
+        tokenCode: tokenCheck.tokenCode,
+        prize: selectedPrize._id,
+        userAgent: req.get("User-Agent"),
+        ipAddress:
+          req.ip || req.connection.remoteAddress || req.socket.remoteAddress,
+      });
+      await spinResult.save();
+      console.log(`💾 Spin result saved: ${spinResult._id}`);
+    }
 
-    // Send response
+    // ส่งผลลัพธ์กลับไป Frontend
     const response = {
       success: true,
       prize: {
@@ -181,19 +218,22 @@ router.post("/spin", async (req, res) => {
         color: selectedPrize.color,
         probability: selectedPrize.probability,
       },
-      spinId: spinResult._id,
+      wheelPosition: selectedIndex, // 🔥 ส่งตำแหน่งที่แน่นอนในวงล้อ (0-7)
+      spinId: spinResult?._id || null,
       tokenUsed: {
         code: tokenCheck.tokenCode,
         usedAt: tokenCheck.usedAt,
       },
       message: "Spin successful",
+      // เพิ่มข้อมูล debug
+      debug: {
+        totalSlots: prizes.length,
+        realPrizes: realPrizes.length,
+        totalProbability: totalProbability,
+      },
     };
 
-    console.log("📤 Sending response:", {
-      prizeName: response.prize.name,
-      tokenCode: response.tokenUsed.code,
-    });
-
+    console.log("📤 Sending response with wheelPosition:", selectedIndex);
     res.json(response);
   } catch (error) {
     console.error("❌ Spin wheel error:", error);
@@ -205,7 +245,7 @@ router.post("/spin", async (req, res) => {
   }
 });
 
-// Get spin statistics (public)
+// ส่วนอื่นๆ เหมือนเดิม...
 router.get("/stats", async (req, res) => {
   try {
     const totalSpins = await SpinResult.countDocuments();
@@ -228,7 +268,6 @@ router.get("/stats", async (req, res) => {
   }
 });
 
-// Health check endpoint
 router.get("/health", (req, res) => {
   res.json({
     status: "OK",
